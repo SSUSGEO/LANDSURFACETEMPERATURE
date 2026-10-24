@@ -1,0 +1,155 @@
+// Center map on the area of interest
+Map.centerObject(aoi, 10);
+
+// Import required packages
+var palettes = require('users/gena/packages:palettes');
+
+// Define date range and cloud cover threshold
+var startDate = '2020-03-06';
+var endDate = '2025-03-25';
+var cloudCoverThreshold = 50; // Images with 50% cloud cover or less will be selected
+
+// Visualization parameters
+var trueColorViz = {
+  bands: ['SR_B4', 'SR_B3', 'SR_B2'],
+  min: 0.0,
+  max: 0.15
+};
+
+var ndviViz = {
+  min: -1,
+  max: 1,
+  palette: ['blue', 'white', 'green']
+};
+
+var lstViz = {
+  min: 25.00,
+  max: 40.00,
+  palette: palettes.colorbrewer.RdBu[9].reverse()
+};
+
+// Function to apply scaling factors
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  return image.addBands(opticalBands, null, true)
+              .addBands(thermalBands, null, true);
+}
+
+// Function to mask clouds and cloud shadows
+function cloudMask(image) {
+  var cloudShadowBitmask = (1 << 3);
+  var cloudBitmask = (1 << 5);
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(cloudShadowBitmask).eq(0)
+                .and(qa.bitwiseAnd(cloudBitmask).eq(0));
+  return image.updateMask(mask);
+}
+
+// Import and preprocess Landsat 5 imagery - CORRECTED COLLECTION PATH
+var imageCollection = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+                      .filterBounds(aoi)
+                      .filterDate(startDate, endDate)
+                      .filter(ee.Filter.lt('CLOUD_COVER', cloudCoverThreshold))
+                      .map(applyScaleFactors)
+                      .map(cloudMask);
+
+// Print out the image IDs and dates used in the collection
+print('Image IDs:', imageCollection.aggregate_array('system:index'));
+print('Image Dates:', imageCollection.aggregate_array('DATE_ACQUIRED'));
+
+// Create a median composite image
+var image = imageCollection.median().clip(aoi);
+
+// Add the processed image to the map with the specified visualization
+Map.addLayer(image, trueColorViz, 'True Color 432');
+
+// Calculate NDVI
+var ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+Map.addLayer(ndvi, ndviViz, 'NDVI');
+
+// Export NDVI image to Google Drive as TIFF
+Export.image.toDrive({
+  image: ndvi,
+  description: 'NDVI2014-2020',
+  folder: 'Gee_Exports',
+  scale: 30,
+  maxPixels: 1e9,
+  region: aoi
+});
+
+// Calculate the minimum and maximum NDVI values within the AOI
+var ndviStats = ndvi.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+var ndviMin = ee.Number(ndviStats.get('NDVI_min'));
+var ndviMax = ee.Number(ndviStats.get('NDVI_max'));
+
+// Fraction of Vegetation (FV) Calculation
+var fv = ((ndvi.subtract(ndviMin)).divide(ndviMax.subtract(ndviMin)))
+          .pow(ee.Number(2))
+          .rename('FV');
+
+// Emissivity Calculation
+var em = fv.multiply(ee.Number(0.004)).add(ee.Number(0.986)).rename('EM');
+
+// Select Thermal Band (Band 6) and rename it
+var thermal = image.select('ST_B10').rename('thermal');
+
+// Calculate Land Surface Temperature (LST)
+var lst = thermal.expression(
+  '(TB / (1 + (0.00115 * (TB / 1.438)) * log(em))) - 273.15', {
+    'TB': thermal.select('thermal'),
+    'em': em
+  }).rename('LST');
+
+// Add the LST Layer to the Map with Custom Visualization Parameters
+Map.addLayer(lst, lstViz, 'LST');
+
+// Export LST image to Google Drive as TIFF
+Export.image.toDrive({
+  image: lst,
+  description: 'LST2014-2020',
+  folder: 'Gee_Exports',
+  scale: 30,
+  maxPixels: 1e9,
+  region: aoi
+});
+
+// Calculate and print statistics
+var stats = lst.reduceRegion({
+  reducer: ee.Reducer.minMax().combine({
+    reducer2: ee.Reducer.mean(),
+    sharedInputs: true
+  }).combine({
+    reducer2: ee.Reducer.median(),
+    sharedInputs: true
+  }),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+print('Temperature Statistics', stats);
+
+// Generate and print histogram of LST values
+var histogram = ui.Chart.image.histogram({
+  image: lst,
+  region: aoi,
+  scale: 30,
+  minBucketWidth: 0.5
+}).setOptions({
+  title: 'Histogram of Land Surface Temperature (LST)',
+  hAxis: {title: 'Temperature (°C)'},
+  vAxis: {title: 'Frequency'},
+  series: [{color: 'blue'}]
+});
+
+print(histogram);
+
+
+code link: https://code.earthengine.google.com/2184a93b5c1c10b46274b5bf2e610f41
